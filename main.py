@@ -37,25 +37,25 @@ def who(t):
  except:return None
 def user(u):
  d=db()
- if d:
+ if d is not None:
   try:return d.users.find_one({"username_key":u.lower()})
   except:pass
  return users.get(u.lower())
 def allmsgs():
  d=db()
- if d:
+ if d is not None:
   try:return list(d.messages.find({"room":"general"},{"_id":0}).sort("created_at",DESCENDING).limit(150))[::-1]
   except:pass
  return msgs[-150:]
 def save(m):
  d=db()
- if d:
+ if d is not None:
   try:d.messages.insert_one(m);return
   except:pass
  msgs.append(m)
 def update(mid,updates,owner=None):
  d=db()
- if d:
+ if d is not None:
   try:
    q={"id":mid}
    if owner is not None:q["username"]=owner
@@ -83,7 +83,7 @@ async def home():return open("index.html",encoding="utf8").read()
 @app.get("/api/health")
 async def health():
  d=db();ok=False
- if d:
+ if d is not None:
   try:d.command("ping");ok=True
   except:pass
  return {"status":"Benyagram online","mongodb":ok,"groq":bool(GROQ),"openweather":bool(OW)}
@@ -94,7 +94,7 @@ async def register(x:Register):
  if user(u):raise HTTPException(409,"Имя уже занято")
  rec={"username":u,"username_key":u.lower(),"display_name":x.display_name.strip(),"password_hash":phash(x.password),"created_at":now(),"role":"member"}
  d=db()
- if d:
+ if d is not None:
   try:d.users.insert_one(rec)
   except:users[u.lower()]=rec
  else:users[u.lower()]=rec
@@ -174,3 +174,4 @@ async def weather(lat:float,lon:float):
  async with httpx.AsyncClient(timeout=15) as c:r=await c.get("https://api.openweathermap.org/data/2.5/weather",params={"lat":lat,"lon":lon,"appid":OW,"units":"metric"})
  if r.status_code!=200:raise HTTPException(502,"Погода недоступна")
  d=r.json();return {"name":d.get("name","Место на карте"),"temp":round(d.get("main",{}).get("temp",0)),"description":d.get("weather",[{}])[0].get("description",""),"icon":d.get("weather",[{}])[0].get("icon","01d"),"humidity":d.get("main",{}).get("humidity"),"wind":d.get("wind",{}).get("speed")}
+  
