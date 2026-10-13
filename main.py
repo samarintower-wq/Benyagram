@@ -10,7 +10,11 @@ try:
  from pymongo import MongoClient, DESCENDING
 except: MongoClient=None; DESCENDING=-1
 app=FastAPI(title="Benyagram");app.mount("/static",StaticFiles(directory="static"),name="static")
-MONGO=os.getenv("MONGODB_URI","");GROQ=os.getenv("GROQ_API_KEY","");OW=os.getenv("OPENWEATHER_API_KEY","");SECRET=os.getenv("APP_SECRET_KEY","please-set-a-long-secret-in-render")
+MONGO=os.getenv("MONGODB_URI","").strip();GROQ=os.getenv("GROQ_API_KEY","").strip();GROQ_MODEL=os.getenv("GROQ_MODEL","openai/gpt-oss-120b").strip();OW=os.getenv("OPENWEATHER_API_KEY","").strip();SECRET=os.getenv("APP_SECRET_KEY","please-set-a-long-secret-in-render")
+CF_ACCOUNT=os.getenv("CLOUDFLARE_ACCOUNT_ID","").strip()
+CF_TOKEN=(os.getenv("CLOUDFLARE_API_TOKEN","").strip() or os.getenv("CLOUDFLARE_API_KEY","").strip())
+CF_IMAGE_MODEL=os.getenv("CLOUDFLARE_IMAGE_MODEL","@cf/black-forest-labs/flux-1-schnell").strip()
+last_mongo_error=None
 client=None;users={};msgs=[];sockets=set()
 def db():
  global client
@@ -48,10 +52,16 @@ def allmsgs():
   except:pass
  return msgs[-150:]
 def save(m):
+ global last_mongo_error
  d=db()
- if d is not None:
-  try:d.messages.insert_one(m);return
-  except:pass
+ if MONGO:
+  if d is None:
+   raise HTTPException(503,"MongoDB настроена, но недоступна. Проверьте MONGODB_URI и логи Render; сообщение не сохранено.")
+  try:
+   d.messages.insert_one(m);last_mongo_error=None;return
+  except Exception as e:
+   last_mongo_error=str(e);print("MongoDB message save failed:",repr(e))
+   raise HTTPException(503,"Не удалось сохранить сообщение в MongoDB. Проверьте логи Render; сообщение не сохранено.")
  msgs.append(m)
 def update(mid,updates,owner=None):
  d=db()
@@ -78,15 +88,61 @@ class Register(BaseModel):
 class Login(BaseModel):username:str;password:str
 class Message(BaseModel):text:str=Field(min_length=1,max_length=4000);reply_to:Optional[str]=None
 class Edit(BaseModel):text:str=Field(min_length=1,max_length=4000)
+class ImagePrompt(BaseModel):prompt:str=Field(min_length=1,max_length=2048)
 @app.get("/",response_class=HTMLResponse)
 async def home():return open("index.html",encoding="utf8").read()
+
+@app.get("/image-generator",response_class=HTMLResponse)
+async def image_generator_page():
+ try:
+  return open("image-generator.html",encoding="utf8").read()
+ except FileNotFoundError:
+  raise HTTPException(404,"Файл image-generator.html не найден в корне репозитория")
+
+@app.post("/api/image-generator")
+async def generate_image(x:ImagePrompt):
+ if not CF_ACCOUNT or not CF_TOKEN:
+  raise HTTPException(503,"Добавьте CLOUDFLARE_ACCOUNT_ID и CLOUDFLARE_API_TOKEN в Render → Environment")
+ prompt=x.prompt.strip()
+ if not prompt:
+  raise HTTPException(400,"Введите описание изображения")
+ url=f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT}/ai/run/{CF_IMAGE_MODEL}"
+ try:
+  async with httpx.AsyncClient(timeout=180) as c:
+   r=await c.post(url,headers={"Authorization":"Bearer "+CF_TOKEN,"Content-Type":"application/json"},json={"prompt":prompt,"steps":4})
+  if r.status_code != 200:
+   try:
+    payload=r.json(); detail=(payload.get("errors") or [{}])[0].get("message") or payload.get("messages") or payload
+   except Exception: detail=r.text[:600]
+   print(f"Cloudflare image API error {r.status_code}: {str(detail)[:800]}")
+   if r.status_code in (401,403): raise HTTPException(502,"Cloudflare отклонил токен. Проверьте CLOUDFLARE_API_TOKEN и разрешения Workers AI.")
+   if r.status_code == 404: raise HTTPException(502,"Cloudflare не нашёл модель или Account ID. Проверьте CLOUDFLARE_ACCOUNT_ID и CLOUDFLARE_IMAGE_MODEL.")
+   raise HTTPException(502,f"Cloudflare не смог сгенерировать изображение (HTTP {r.status_code}). Подробности есть в логах Render.")
+  payload=r.json()
+  result=payload.get("result",payload)
+  image_b64=result.get("image") if isinstance(result,dict) else None
+  if not image_b64:
+   print("Cloudflare image response did not contain result.image:",str(payload)[:500])
+   raise HTTPException(502,"Cloudflare вернул ответ без изображения. Проверьте логи Render.")
+  return {"ok":True,"prompt":prompt,"model":CF_IMAGE_MODEL,"image":"data:image/jpeg;base64,"+image_b64}
+ except HTTPException:
+  raise
+ except httpx.TimeoutException:
+  raise HTTPException(504,"Cloudflare генерирует слишком долго. Попробуйте ещё раз.")
+ except Exception as e:
+  print("Cloudflare image generation failed:",repr(e))
+  raise HTTPException(502,"Не удалось связаться с Cloudflare. Проверьте логи Render.")
 @app.get("/api/health")
 async def health():
+ global last_mongo_error
  d=db();ok=False
  if d is not None:
-  try:d.command("ping");ok=True
-  except:pass
- return {"status":"Benyagram online","mongodb":ok,"groq":bool(GROQ),"openweather":bool(OW)}
+  try:
+   d.command("ping");ok=True;last_mongo_error=None
+  except Exception as e:
+   last_mongo_error=str(e);print("MongoDB health check failed:",repr(e))
+ storage="mongodb" if ok else "memory_only"
+ return {"status":"Benyagram online","mongodb":ok,"mongodb_configured":bool(MONGO),"storage":storage,"storage_warning":None if ok else ("MONGODB_URI не задана" if not MONGO else "MongoDB недоступна; проверьте URI, пароль и Network Access в Atlas"),"groq":bool(GROQ),"groq_model":GROQ_MODEL,"openweather":bool(OW),"cloudflare":bool(CF_ACCOUNT and CF_TOKEN),"cloudflare_model":CF_IMAGE_MODEL}
 @app.post("/api/register")
 async def register(x:Register):
  u=x.username.strip()
@@ -123,12 +179,30 @@ async def ws_endpoint(ws:WebSocket):
   while True:await ws.receive_text()
  except: sockets.discard(ws)
 async def ai(prompt,u):
- if not GROQ:return "Добавьте GROQ_API_KEY в Render, чтобы включить ИИ. Сообщение сохранено."
+ if not GROQ:return "ИИ не настроен: добавьте GROQ_API_KEY в Render → Environment. Ваше исходное сообщение сохранено."
  try:
-  async with httpx.AsyncClient(timeout=45) as c:
-   r=await c.post("https://api.groq.com/openai/v1/chat/completions",headers={"Authorization":"Bearer "+GROQ},json={"model":"llama-3.3-70b-versatile","messages":[{"role":"system","content":"Ты Benyagram AI — доброжелательный помощник общего чата. Отвечай на языке пользователя, кратко и полезно."},{"role":"user","content":f"Пользователь @{u} пишет тебе: {prompt}"}],"max_tokens":700})
-  return r.json()["choices"][0]["message"]["content"].strip() if r.status_code==200 else "AI временно недоступен, попробуйте ещё раз."
- except:return "Не удалось соединиться с AI. Попробуйте ещё раз."
+  async with httpx.AsyncClient(timeout=60) as c:
+   r=await c.post("https://api.groq.com/openai/v1/chat/completions",headers={"Authorization":"Bearer "+GROQ},json={"model":GROQ_MODEL,"messages":[{"role":"system","content":"Ты Benyagram AI — доброжелательный помощник общего чата. Отвечай на языке пользователя, кратко и полезно."},{"role":"user","content":f"Пользователь @{u} пишет тебе: {prompt}"}],"max_tokens":700})
+  if r.status_code==200:
+   data=r.json();choices=data.get("choices") or []
+   if choices and choices[0].get("message",{}).get("content"):
+    return choices[0]["message"]["content"].strip()
+   print("Groq returned no message content:",r.text[:1000])
+   return "ИИ вернул пустой ответ. Попробуйте задать вопрос ещё раз."
+  try:
+   detail=r.json().get("error",{}).get("message") or r.text[:500]
+  except Exception: detail=r.text[:500]
+  print(f"Groq API error {r.status_code}, model={GROQ_MODEL}: {detail}")
+  if r.status_code in (401,403): return "Ошибка Groq: API-ключ недействителен или не имеет доступа. Проверьте GROQ_API_KEY в Render."
+  if r.status_code==404: return f"Ошибка Groq: модель «{GROQ_MODEL}» не найдена. В Render добавьте GROQ_MODEL=openai/gpt-oss-120b."
+  if r.status_code==429: return "Groq временно ограничил запросы (лимит или квота). Попробуйте позже и проверьте лимиты GroqCloud."
+  return f"Ошибка Groq API ({r.status_code}). Проверьте логи Render; подробности записаны в лог без API-ключа."
+ except httpx.TimeoutException:
+  print("Groq API timeout")
+  return "ИИ не ответил вовремя. Попробуйте ещё раз через несколько секунд."
+ except Exception as e:
+  print("Groq request failed:",repr(e))
+  return "Не удалось связаться с Groq. Проверьте логи Render и доступность API."
 @app.post("/api/messages")
 async def post(x:Message,req:Request):
  u=auth(req);usr=user(u) or {};txt=x.text.strip()
@@ -174,4 +248,4 @@ async def weather(lat:float,lon:float):
  async with httpx.AsyncClient(timeout=15) as c:r=await c.get("https://api.openweathermap.org/data/2.5/weather",params={"lat":lat,"lon":lon,"appid":OW,"units":"metric"})
  if r.status_code!=200:raise HTTPException(502,"Погода недоступна")
  d=r.json();return {"name":d.get("name","Место на карте"),"temp":round(d.get("main",{}).get("temp",0)),"description":d.get("weather",[{}])[0].get("description",""),"icon":d.get("weather",[{}])[0].get("icon","01d"),"humidity":d.get("main",{}).get("humidity"),"wind":d.get("wind",{}).get("speed")}
-  
+ 
